@@ -112,10 +112,18 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
     () => analyze(req(pcap([s.syn(), ...frags.filter((_, i) => i !== 2)]))), 'MISSING_FRAGMENT');
   // 同偏移分片字节冲突（用 ipFragment 重建，确保 IP 头校验和仍然正确）
   const evilPart = Buffer.from(seg.subarray(16, 24)); // 第 3 片 IP 载荷（offset=2），含流[4..11]
-  evilPart[2] ^= 0x5a;
+  evilPart[2] ^= 0x5a; // 数据报偏移 18 处字节被改
   const evil = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9000, part: evilPart, offset: 2, mf: true });
-  expectCode('分片: 同偏移异字节拒绝拼接',
-    () => analyze(req(pcap([s.syn(), ...frags, evil, s.fin(18)]))), 'FRAGMENT_CONFLICT');
+  // 异字节覆盖在数据报闭合之后才到达：代际间同样无法一致解释，必须拒绝并定位
+  // 包号：#1 SYN，#2..#6 五片（闭合），#7 evil，#8 FIN
+  try {
+    analyze(req(pcap([s.syn(), ...frags, evil, s.fin(18)])));
+    ok('分片: 同偏移异字节拒绝拼接', false);
+  } catch (e) {
+    ok('分片: 同偏移异字节拒绝拼接', e.code === 'FRAGMENT_CONFLICT', `${e.code}: ${e.message}`);
+    eq('分片: 跨代冲突定位首个包号', [e.packet, e.packet2], [4, 7]);
+    eq('分片: 跨代冲突定位偏移与区间', [e.offset, ...e.range], [18, 18, 19]);
+  }
 }
 
 // ---------- 4b. VLAN / IP-TCP 选项 / 以太网填充 ----------
@@ -177,6 +185,68 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   });
   expectCode('tcp: 两个 SYN 序号不同即拒绝',
     () => analyze(req(pcap([s.syn(), syn2, s.data(0, 3), s.fin(3)]))), 'CONFLICT');
+}
+
+// ---------- 4d. 断续链路：首片后到 / 标识复用 / 迟到重传 / 覆盖冲突 ----------
+{
+  const s = makeSession({ commands: ['NAV FIX A1', 'HOLD'] }); // 帧长 12+6 = 18 字节
+  const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream });
+  const frags = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9000, payload: seg, chunkSize: 8 });
+  // 5 片：[0,8) [8,16) [16,24) [24,32) [32,38)，frags[4] 为末片
+
+  // (1) 首片后到：末片与中间片全部先出现，偏移 0 的首片最后才到
+  // 包号：#1 SYN，#2 f4，#3 f2，#4 f3，#5 f1，#6 f0，#7 FIN
+  const lateFirst = [frags[4], frags[2], frags[3], frags[1], frags[0]];
+  const r1 = analyze(req(pcap([s.syn(), ...lateFirst, s.fin(18)])));
+  eq('断续: 首片最后到达仍重建指令', r1.commands.map((c) => c.text), ['NAV FIX A1', 'HOLD']);
+  eq('断续: 首片后到指令一包号归属', r1.commands[0].packets, [3, 4]);
+  eq('断续: 首片后到指令二归属末片', r1.commands[1].packets, [2]);
+
+  // (2) 顺序复用相同标识：A 完整结束后，同一 (源,目的,协议,标识) 立即被 B 复用
+  const segA = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream.subarray(0, 10) });
+  const segB = tcp({ sport: s.sport, dport: s.dport, seq: (s.dataStart + 10) >>> 0, flags: 0x18, data: s.stream.subarray(10, 18) });
+  const fragsA = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7700, payload: segA, chunkSize: 8 }); // 30 字节→4 片
+  const fragsB = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7700, payload: segB, chunkSize: 8 }); // 28 字节→4 片
+  // 包号：#1 SYN；#2..#5 = A2 A0 A3 A1（A 乱序闭合）；#6..#9 = B1 B3 B0 B2（B 乱序闭合）；#10 FIN
+  const r2 = analyze(req(pcap([
+    s.syn(),
+    fragsA[2], fragsA[0], fragsA[3], fragsA[1],
+    fragsB[1], fragsB[3], fragsB[0], fragsB[2],
+    s.fin(18),
+  ])));
+  eq('复用: 同标识两条数据报各自独立重建', r2.commands.map((c) => c.text), ['NAV FIX A1', 'HOLD']);
+  eq('复用: 数据报计数（SYN/A/B/FIN）', r2.datagramCount, 4);
+  // 指令一 流[0,12)：A 数据报 [20,30)（A2=#2、A3=#4）+ B 数据报 [20,22)（B2=#9）
+  eq('复用: 跨数据报指令包号归属', r2.commands[0].packets, [2, 4, 9]);
+  // 指令二 流[12,18)：B 数据报 [22,28)（B2=#9、B3=#7），不得混入 A 的历史包号
+  eq('复用: 新一代包号不与历史拼接', r2.commands[1].packets, [7, 9]);
+
+  // (3) 迟到完全相同重传：数据报闭合后，首片与末片的逐字节相同重传才到
+  // 包号：#1 SYN，#2 f1，#3 f0，#4 f2，#5 f3，#6 f4（闭合），#7 f0 重传，#8 f4 重传，#9 FIN
+  const r3 = analyze(req(pcap([
+    s.syn(),
+    frags[1], frags[0], frags[2], frags[3], frags[4],
+    frags[0], frags[4],
+    s.fin(18),
+  ])));
+  eq('重传: 迟到相同重传不拆散数据报', r3.commands.map((c) => c.text), ['NAV FIX A1', 'HOLD']);
+  eq('重传: 重传不产生幻影数据报', r3.datagramCount, 3);
+  eq('重传: 指令一包号归属不变', r3.commands[0].packets, [4, 5]);
+  eq('重传: 指令二包号归属不变', r3.commands[1].packets, [6]);
+
+  // (4) 不同字节覆盖：代内（闭合前）与代际（闭合后）都必须拒绝并定位
+  const evilPart = Buffer.from(seg.subarray(16, 24)); // 第 3 片（offset=2），含流[4..11]
+  evilPart[2] ^= 0x5a; // 数据报偏移 18 处字节被改
+  const evilInner = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9000, part: evilPart, offset: 2, mf: true });
+  // 代内：#1 SYN，#2 f0，#3 f1，#4 f2，#5 evil（闭合前到达），#6 f3，#7 f4，#8 FIN
+  try {
+    analyze(req(pcap([s.syn(), frags[0], frags[1], frags[2], evilInner, frags[3], frags[4], s.fin(18)])));
+    ok('覆盖: 代内同偏移异字节拒绝', false);
+  } catch (e) {
+    ok('覆盖: 代内同偏移异字节拒绝', e.code === 'FRAGMENT_CONFLICT', `${e.code}: ${e.message}`);
+    eq('覆盖: 代内冲突定位包号', [e.packet, e.packet2], [4, 5]);
+    eq('覆盖: 代内冲突定位偏移与区间', [e.offset, ...e.range], [18, 18, 19]);
+  }
 }
 
 // ---------- 5. TCP 重组 ----------
