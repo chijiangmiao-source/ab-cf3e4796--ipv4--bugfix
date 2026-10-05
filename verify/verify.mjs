@@ -118,6 +118,182 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
     () => analyze(req(pcap([s.syn(), ...frags, evil, s.fin(18)]))), 'FRAGMENT_CONFLICT');
 }
 
+// ---------- 4d. 断续链路四类捕获：首片后到 / 顺序复用相同标识 / 迟到相同重传 / 异字节覆盖 ----------
+{
+  // ① 首片后到：一个承载数据的数据报被分片，末片+中间片先到、偏移 0 的首片最晚到
+  {
+    const s = makeSession({ commands: ['ARM GRID-07', 'SAFE'] }); // 帧长 13+6 = 19
+    const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream });
+    const f = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x6100, payload: seg, chunkSize: 8 });
+    // 到达：末片 f4(#2)、f2(#3)/f3(#4)/f1(#5)，首片 f0(#6) 最后；SYN(#1) FIN(#7)
+    const cap = pcap([s.syn(), f[4], f[2], f[3], f[1], f[0], s.fin(19)]);
+    let r = null;
+    try { r = analyze(req(cap)); } catch (e) { ok('①首片后到: 完整乱序分片应重组', false, e.message); }
+    if (r) {
+      eq('①首片后到: 重建指令连续', r.commands.map((c) => c.text), ['ARM GRID-07', 'SAFE']);
+      eq('①首片后到: SYN/FIN 包号', [r.synPacket, r.finPacket], [1, 7]);
+      // seg=20 头+19 数据，8 字节切片：f2(#3)→流[0,4)，f3(#4)→流[4,12)，末片 f4(#2)→流[12,19)
+      eq('①首片后到: 指令一包号归属(跨3片)', r.commands[0].packets, [2, 3, 4]);
+      eq('①首片后到: 指令二包号归属(最先到达的末片)', r.commands[1].packets, [2]);
+      eq('①首片后到: 指令区间', [r.commands[0].byteRange, r.commands[1].byteRange], [[0, 13], [13, 19]]);
+    }
+  }
+
+  // ② 顺序复用相同标识：两个各自分片、长度/内容不同的数据报先后复用同一 IP id
+  //    gen2 仍“末片先到、首片后到”，必须独立重组，绝不与 gen1 历史字节拼接
+  {
+    const s = makeSession({ commands: ['REUSE-ONE', 'TWO'] }); // 帧长 11+5 = 16
+    const seg1 = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream.subarray(0, 11) });
+    const seg2 = tcp({ sport: s.sport, dport: s.dport, seq: (s.dataStart + 11) >>> 0, flags: 0x18, data: s.stream.subarray(11, 16) });
+    const g1 = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7777, payload: seg1, chunkSize: 8 }); // 封口 31
+    const g2 = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7777, payload: seg2, chunkSize: 8 }); // 封口 25
+    // gen1 #2..#5 收齐结束；gen2 末片#6→中间#7/#8→首片#9；FIN #10
+    const cap = pcap([s.syn(), ...g1, g2[3], g2[2], g2[1], g2[0], s.fin(16)]);
+    let r = null;
+    try { r = analyze(req(cap)); } catch (e) { ok('②顺序复用: 两个数据报应独立重组', false, e.message); }
+    if (r) {
+      eq('②顺序复用: 指令不串代际', r.commands.map((c) => c.text), ['REUSE-ONE', 'TWO']);
+      eq('②顺序复用: 流长度', r.streamLength, 16);
+      eq('②顺序复用: 重组数据报数(SYN/FIN+2分片报)', r.datagramCount, 4);
+      // 流[0,4) 在 g1[2](#4)，流[4,11) 在末片 g1[3](#5)
+      eq('②顺序复用: 指令一仅属第一代包号', r.commands[0].packets, [4, 5]);
+      // 流[11,15) 在 g2[2](#7)，流[15] 在最先到达的末片 g2[3](#6)；与第一代不交叉
+      eq('②顺序复用: 指令二仅属第二代包号', r.commands[1].packets, [6, 7]);
+      ok('②顺序复用: 两代包号不交叉',
+        !r.commands[0].packets.some((p) => r.commands[1].packets.includes(p)));
+    }
+  }
+
+  // ②' 分片数据报与“已完整结束（未分片）”数据报复用同一 IPv4 标识，两个方向都要独立
+  {
+    const s = makeSession({ commands: ['PING', 'PONG'] }); // 6+6 = 12
+
+    // 分片数据报（流[0,6)，全部中间片+末片先到、首片最后到）结束后，再来一条未分片完整数据报复用同 id（流[6,12)）
+    {
+      const frags = s.dataFrags(0, 6, 8, 0xaaaa); // 26 字节 IP 载荷 → 4 片
+      const unfrag = s.data(6, 6, { id: 0xaaaa });
+      const order = [frags[3], frags[1], frags[2], frags[0]]; // 末片#2、中间#3/#4、首片#5 最后
+      let r = null;
+      try { r = analyze(req(pcap([s.syn(), ...order, unfrag, s.fin(12)]))); }
+      catch (e) { ok('②′分片→完整复用: 应独立重组', false, e.message); }
+      if (r) {
+        eq('②′分片→完整复用: 指令', r.commands.map((c) => c.text), ['PING', 'PONG']);
+        // 流[0,4) 在 f2#4，流[4,6) 在最先到达的末片 f3#2；首片 f0#5 只含 TCP 头
+        eq('②′分片→完整复用: 指令一包号(末片先到/首片最后)', r.commands[0].packets, [2, 4]);
+        eq('②′分片→完整复用: 指令二仅属完整数据报#6', r.commands[1].packets, [6]);
+      }
+    }
+
+    // 反向：先一条未分片完整数据报（流[0,6)），其后分片数据报（流[6,12)，首片最后到）复用同 id
+    {
+      const unfrag = s.data(0, 6, { id: 0xbbbb });
+      const frags = s.dataFrags(6, 6, 8, 0xbbbb);
+      const order = [frags[3], frags[1], frags[2], frags[0]]; // 末片#3、中间#4/#5、首片#6 最后
+      let r = null;
+      try { r = analyze(req(pcap([s.syn(), unfrag, ...order, s.fin(12)]))); }
+      catch (e) { ok('②′完整→分片复用: 应独立重组', false, e.message); }
+      if (r) {
+        eq('②′完整→分片复用: 指令', r.commands.map((c) => c.text), ['PING', 'PONG']);
+        eq('②′完整→分片复用: 指令一仅属完整数据报#2', r.commands[0].packets, [2]);
+        eq('②′完整→分片复用: 指令二包号(末片#3/中间#5,首片#6仅头)', r.commands[1].packets, [3, 5]);
+      }
+    }
+  }
+
+  // ③ 迟到的完全相同重传：数据报结束后又来逐字节相同的中间片与首片，接受并计入包号
+  {
+    const s = makeSession({ commands: ['LATE-RETX', 'OK'] }); // 帧长 11+4 = 15
+    const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream });
+    const f = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x8200, payload: seg, chunkSize: 8 });
+    const dupMid = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x8200, part: seg.subarray(24, 32), offset: 3, mf: true });   // #8 同 f3
+    const dupFirst = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x8200, part: seg.subarray(0, 8), offset: 0, mf: true });    // #9 同 f0 首片
+    const cap = pcap([s.syn(), ...f, s.fin(15), dupMid, dupFirst]); // 正常 #2..#6，FIN #7
+    let r = null;
+    try { r = analyze(req(cap)); } catch (e) { ok('③迟到相同重传: 应接受', false, e.message); }
+    if (r) {
+      eq('③迟到相同重传: 重建指令', r.commands.map((c) => c.text), ['LATE-RETX', 'OK']);
+      // 流[0,12) 由 #4(流0..3)/#5(流4..11) 承载，#8 是 #5 相同字节的迟到重传，也要计入
+      eq('③迟到相同重传: 指令一含迟到重传包号', r.commands[0].packets, [4, 5, 8]);
+      eq('③迟到相同重传: 指令二包号(含跨片重传)', r.commands[1].packets, [5, 6, 8]);
+      ok('③迟到相同重传: 纯首片重传(#9,仅IP头)不计入任何指令',
+        !r.commands.some((c) => c.packets.includes(9)));
+    }
+  }
+
+  // ④ 不同字节覆盖：代际内（封口前）与代际间（结束后且无新首片）都必须 FRAGMENT_CONFLICT 定位
+  {
+    const s = makeSession({ commands: ['NAV FIX A1', 'HOLD'] }); // 18
+    const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream });
+
+    // ④-a 代际内：f2(#4) 已安放 offset=2，封口末片到达前 #5 以异字节覆盖同偏移
+    const f = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9300, payload: seg, chunkSize: 8 });
+    const inner = Buffer.from(seg.subarray(16, 24)); inner[4] ^= 0xa5; // IP 偏移 20 处改字节
+    const evilInner = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9300, part: inner, offset: 2, mf: true });
+    try {
+      analyze(req(pcap([s.syn(), f[0], f[1], f[2], evilInner, f[3], f[4], s.fin(18)])));
+      ok('④-a代际内覆盖: 必须拒绝', false);
+    } catch (e) {
+      ok('④-a代际内覆盖: FRAGMENT_CONFLICT', e.code === 'FRAGMENT_CONFLICT', e.code);
+      eq('④-a代际内覆盖: 冲突两包号', [e.packet, e.packet2], [4, 5]);
+      eq('④-a代际内覆盖: 数据报内偏移', e.offset, 20);
+      eq('④-a代际内覆盖: 冲突区间', e.range, [20, 21]);
+    }
+
+    // ④-b 代际间：数据报 #2..#6 已结束、FIN #7，#8 以异字节覆盖历史偏移且再无新首片
+    const g = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9400, payload: seg, chunkSize: 8 });
+    const cross = Buffer.from(seg.subarray(24, 32)); cross[0] ^= 0x5a; // IP 偏移 24 处改字节
+    const evilCross = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9400, part: cross, offset: 3, mf: true });
+    try {
+      analyze(req(pcap([s.syn(), ...g, s.fin(18), evilCross])));
+      ok('④-b代际间覆盖: 必须拒绝', false);
+    } catch (e) {
+      ok('④-b代际间覆盖: FRAGMENT_CONFLICT（不得伪装成新数据报缺片）', e.code === 'FRAGMENT_CONFLICT', e.code);
+      // IP 偏移 24 的原字节由 #5(f3) 承载，覆盖者 #8；保留首个原始包号/偏移/冲突区间
+      eq('④-b代际间覆盖: 历史包/覆盖包', [e.packet, e.packet2], [5, 8]);
+      eq('④-b代际间覆盖: 数据报内偏移', e.offset, 24);
+      eq('④-b代际间覆盖: 冲突区间', e.range, [24, 25]);
+      ok('④-b代际间覆盖: 给出已到分片包号',
+        Array.isArray(e.extra?.fragmentPackets) && e.extra.fragmentPackets.includes(8));
+    }
+  }
+
+  // ⑤ 截断：分片越过末片封口长度（代际内）或迟到片越过已结束数据报封口（代际间），均拒绝
+  {
+    const s = makeSession({ commands: ['TRUNC-CHK'] });
+    const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream }); // 20+11 = 31
+
+    // ⑤-a 代际内：末片封口 31，另一片 offset=3 覆盖到 32（末片先到）
+    {
+      const last = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9500, part: seg.subarray(24, 31), offset: 3, mf: false }); // 封口 31
+      const over = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9500, part: seg.subarray(16, 24), offset: 3, mf: true });  // [24,32) 越过封口
+      const f0 = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9500, part: seg.subarray(0, 8), offset: 0, mf: true });
+      try {
+        analyze(req(pcap([s.syn(), last, over, f0]))); // 末片 #2、越界片 #3、首片 #4
+        ok('⑤-a代际内截断: 必须拒绝', false);
+      } catch (e) {
+        ok('⑤-a代际内截断: FRAGMENT_CONFLICT', e.code === 'FRAGMENT_CONFLICT', e.code);
+        eq('⑤-a代际内截断: 包号', [e.packet, e.packet2], [2, 3]);
+        eq('⑤-a代际内截断: 封口偏移/越界区间', [e.offset, e.range], [31, [31, 32]]);
+      }
+    }
+
+    // ⑤-b 代际间：gen1(#2..#5) 封口 31 并完整结束；#6 前 7 字节与历史相同、却多 1 字节越过封口
+    {
+      const f = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9600, payload: seg, chunkSize: 8 });
+      const overPart = Buffer.concat([seg.subarray(24, 31), Buffer.from([0x5a])]); // 8 字节 @offset3 → [24,32)
+      const over = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x9600, part: overPart, offset: 3, mf: true });
+      try {
+        analyze(req(pcap([s.syn(), ...f, s.fin(11), over])));
+        ok('⑤-b代际间截断: 必须拒绝', false);
+      } catch (e) {
+        ok('⑤-b代际间截断: FRAGMENT_CONFLICT（不得并入历史、不得另开缺片代际）', e.code === 'FRAGMENT_CONFLICT', e.code);
+        eq('⑤-b代际间截断: 封口偏移/越界区间', [e.offset, e.range], [31, [31, 32]]);
+      }
+    }
+  }
+}
+
+
 // ---------- 4b. VLAN / IP-TCP 选项 / 以太网填充 ----------
 {
   const s = makeSession({ commands: ['VL','OPTS','PAD'] }); // 帧长 4+6+5 = 15
